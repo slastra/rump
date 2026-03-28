@@ -1,6 +1,6 @@
 # RUMP
 
-**R**ust **U**tility for **M**ounting and **P**laying
+**R**adio **U**plink for **M**edia **P**ublishing
 
 A clean, modern Icecast streaming client. Inspired by [BUTT](https://danielnoethen.de/butt/), rebuilt from scratch with a modern stack.
 
