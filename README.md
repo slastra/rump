@@ -20,7 +20,7 @@ Built with Rust, GTK4/libadwaita, PipeWire, and OGG Vorbis.
 
 ## Screenshot
 
-![RUMP](shot.png)
+![RUMP](screenshot.png)
 
 ## Install
 
@@ -60,21 +60,32 @@ makepkg -si
 
 ## Architecture
 
-```
-pw-record (music)  → capture thread → music channel ──┐
-                                                       ├→ stream thread (mix + duck + encode → Icecast)
-pw-record (mic)    → capture thread → mic channel ─────┘
-                                                        ↑
-evdev PTT thread ──── is_mic_active ────────────────────┘
+```mermaid
+graph LR
+    subgraph PipeWire
+        PW1[pw-record\nmusic]
+        PW2[pw-record\nmic]
+    end
 
-playerctl --follow → metadata thread → SharedMetadata → UI + Icecast
-```
+    subgraph Threads
+        C1[Music Capture]
+        C2[Mic Capture]
+        S[Stream Thread\nmix + duck + encode]
+        PTT[PTT Listener\nevdev]
+        META[Metadata\nplayerctl]
+    end
 
-- **Capture threads** run independently, always updating VU meters
-- **Stream thread** runs only while streaming, handles encoding + mixing + reconnection
-- **PTT thread** monitors keyboard via evdev for global push-to-talk
-- **Metadata thread** follows MPRIS players for track info
-- All threads communicate via `Arc<AtomicBool>` flags and `crossbeam` channels
+    PW1 --> C1
+    PW2 --> C2
+    C1 -- music channel --> S
+    C2 -- mic channel --> S
+    PTT -- is_mic_active --> S
+    S -- OGG Vorbis --> IC[Icecast]
+    META -- track info --> UI[GTK4 UI]
+    META -- track info --> IC
+    C1 -- VU levels --> UI
+    C2 -- VU levels --> UI
+```
 
 ## Configuration
 
