@@ -1,0 +1,26 @@
+/* VU meter colors */
+levelbar trough block.filled {
+    background-color: @success_color;
+}
+
+levelbar trough block.level-yellow {
+    background-color: @warning_color;
+}
+
+levelbar trough block.level-red {
+    background-color: @error_color;
+}
+
+/* Timer uses monospace */
+.timer-label {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-feature-settings: "tnum";
+}
+
+/* VU meter labels */
+.vu-label {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 10pt;
+    min-width: 16px;
+    opacity: 0.5;
+}

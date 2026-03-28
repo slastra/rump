@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=RUMP
+Comment=Icecast Streaming Client
+Exec=rump
+Icon=goodvibes
+Terminal=false
+Type=Application
+Categories=Audio;AudioVideo;
+Keywords=icecast;streaming;radio;broadcast;
