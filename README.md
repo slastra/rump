@@ -61,10 +61,6 @@ makepkg -si
 ## Architecture
 
 ```mermaid
----
-config:
-  layout: elk
----
 graph LR
     subgraph PipeWire
         PW1[pw-record\nmusic]
