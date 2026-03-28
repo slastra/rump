@@ -24,15 +24,15 @@ Built with Rust, GTK4/libadwaita, PipeWire, and OGG Vorbis.
 ┌──────────────────────────────────────────┐
 │ [Header]        RUMP   Live        [≡]   │
 ├──────────────────────────────────────────┤
-│ [▶] [🎤] Song Title           01:23:45   │
-│           Artist Name                    │
+│ [▶] [🎤] Baby Got Back        01:23:45   │
+│           Sir Mix-a-Lot                  │
 │ L ████████████████░░░░░░░░               │
 │ R ████████████████░░░░░░░░               │
 │ M ██████░░░░░░░░░░░░░░░░░░               │
 │                                          │
 │ [12:34:56] Connected to Icecast          │
 │ [12:34:56] Streaming started             │
-│ [12:35:02] Now playing: Artist - Title   │
+│ [12:35:02] Now playing: Sir Mix-a-Lot - Baby Got Back │
 └──────────────────────────────────────────┘
 ```
 
