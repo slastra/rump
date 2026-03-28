@@ -3,6 +3,8 @@ name = "rump"
 version = "0.1.0"
 edition = "2021"
 description = "Icecast streaming client with GTK4 UI"
+license = "MIT"
+repository = "https://github.com/slastra/rump"
 
 [dependencies]
 gtk4 = "0.11"
