@@ -234,7 +234,7 @@ pub fn build_ui(app: &adw::Application) {
                     }
                 }
             }
-            start_ptt(&mut s, &config);
+            start_ptt(&s, &config);
         });
         app.add_action(&a);
     }
@@ -250,8 +250,20 @@ pub fn build_ui(app: &adw::Application) {
                 .version(env!("CARGO_PKG_VERSION"))
                 .developer_name("Shaun Lastra")
                 .license_type(gtk4::License::MitX11)
-                .comments("Icecast streaming client with DJ mic mixing")
+                .comments("Radio Uplink for Media Publishing\n\nA modern Icecast streaming client with DJ mic mixing, auto-ducking, and push-to-talk. Built with Rust, GTK4, PipeWire, and OGG Vorbis.")
+                .website("https://github.com/slastra/rump")
+                .issue_url("https://github.com/slastra/rump/issues")
                 .build();
+            about.add_credit_section(Some("Inspired By"), &[
+                "BUTT (Broadcast Using This Tool) https://danielnoethen.de/butt/",
+            ]);
+            about.add_credit_section(Some("Built With"), &[
+                "GTK4 + libadwaita",
+                "PipeWire (pw-record)",
+                "OGG Vorbis (vorbis_rs)",
+                "playerctl (MPRIS)",
+                "XDG Portal + evdev (PTT)",
+            ]);
             about.present();
         });
         app.add_action(&a);
@@ -274,7 +286,7 @@ pub fn build_ui(app: &adw::Application) {
                 start_mic_capture(&mut s, dev.serial, &config);
             }
         }
-        start_ptt(&mut s, &config);
+        start_ptt(&s, &config);
         s.metadata_thread = Some(metadata::spawn_metadata_listener(
             s.metadata.clone(),
             s.metadata_stop.clone(),

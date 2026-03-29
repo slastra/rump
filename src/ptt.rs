@@ -1,71 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
+use std::time::Duration;
 
-use evdev::{Device, EventType, KeyCode};
+use futures_util::StreamExt;
+use gtk4::glib;
 
 use crate::log::{SharedLog, log_msg};
-
-fn parse_single_key(name: &str) -> Option<KeyCode> {
-    match name.to_uppercase().as_str() {
-        "SPACE" => Some(KeyCode::KEY_SPACE),
-        "F1" => Some(KeyCode::KEY_F1),
-        "F2" => Some(KeyCode::KEY_F2),
-        "F3" => Some(KeyCode::KEY_F3),
-        "F4" => Some(KeyCode::KEY_F4),
-        "F5" => Some(KeyCode::KEY_F5),
-        "F6" => Some(KeyCode::KEY_F6),
-        "F7" => Some(KeyCode::KEY_F7),
-        "F8" => Some(KeyCode::KEY_F8),
-        "F9" => Some(KeyCode::KEY_F9),
-        "F10" => Some(KeyCode::KEY_F10),
-        "F11" => Some(KeyCode::KEY_F11),
-        "F12" => Some(KeyCode::KEY_F12),
-        "CAPSLOCK" => Some(KeyCode::KEY_CAPSLOCK),
-        "SCROLLLOCK" => Some(KeyCode::KEY_SCROLLLOCK),
-        "PAUSE" => Some(KeyCode::KEY_PAUSE),
-        "INSERT" => Some(KeyCode::KEY_INSERT),
-        "HOME" => Some(KeyCode::KEY_HOME),
-        "END" => Some(KeyCode::KEY_END),
-        "PAGEUP" => Some(KeyCode::KEY_PAGEUP),
-        "PAGEDOWN" => Some(KeyCode::KEY_PAGEDOWN),
-        _ => None,
-    }
-}
-
-/// Parse a modifier name to its left+right evdev KeyCode pair.
-fn parse_modifier(name: &str) -> Option<(KeyCode, KeyCode)> {
-    match name.to_uppercase().as_str() {
-        "ALT" => Some((KeyCode::KEY_LEFTALT, KeyCode::KEY_RIGHTALT)),
-        "CTRL" | "CONTROL" => Some((KeyCode::KEY_LEFTCTRL, KeyCode::KEY_RIGHTCTRL)),
-        "SHIFT" => Some((KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT)),
-        "SUPER" | "META" => Some((KeyCode::KEY_LEFTMETA, KeyCode::KEY_RIGHTMETA)),
-        _ => None,
-    }
-}
-
-/// A parsed PTT key combo (optional modifier + key).
-struct PttCombo {
-    modifier: Option<(KeyCode, KeyCode)>, // (left, right) variants
-    key: KeyCode,
-}
-
-/// Parse a combo string like "Alt+Space", "Ctrl+F1", or just "F5".
-fn parse_combo(combo: &str) -> Option<PttCombo> {
-    let parts: Vec<&str> = combo.split('+').collect();
-    match parts.len() {
-        1 => {
-            let key = parse_single_key(parts[0])?;
-            Some(PttCombo { modifier: None, key })
-        }
-        2 => {
-            let modifier = parse_modifier(parts[0]);
-            let key = parse_single_key(parts[1])?;
-            Some(PttCombo { modifier, key })
-        }
-        _ => None,
-    }
-}
 
 pub const PTT_MODIFIER_OPTIONS: &[&str] = &["None", "Alt", "Ctrl", "Shift", "Super"];
 
@@ -76,45 +17,182 @@ pub const PTT_KEY_OPTIONS: &[&str] = &[
     "Home", "End", "PageUp", "PageDown",
 ];
 
-/// Spawn a thread that listens for a key combo on all keyboard devices.
-/// `combo_str` can be "Space", "Alt+Space", "Ctrl+F1", etc.
-pub fn spawn_ptt_listener(
-    combo_str: &str,
+fn combo_to_xdg_trigger(combo: &str) -> String {
+    let parts: Vec<&str> = combo.split('+').collect();
+    let (modifier, key) = if parts.len() == 2 {
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, parts[0])
+    };
+    let key_lower = key.to_lowercase();
+    match modifier {
+        Some(m) => format!("<{m}>{key_lower}"),
+        None => key_lower,
+    }
+}
+
+/// Start PTT. Tries XDG Portal first, falls back to evdev.
+pub fn start_ptt(combo_str: &str, mic_ptt: Arc<AtomicBool>, log: SharedLog) {
+    let trigger = combo_to_xdg_trigger(combo_str);
+    let combo = combo_str.to_string();
+    let mic_ptt_clone = mic_ptt.clone();
+    let log_clone = log.clone();
+
+    log_msg(&log, &format!("PTT: trying XDG Portal for {combo}..."));
+
+    // Try portal with a timeout. If it hangs (common on Hyprland), fall back to evdev.
+    let portal_ready = Arc::new(AtomicBool::new(false));
+    let portal_ready_clone = portal_ready.clone();
+
+    glib::spawn_future_local(async move {
+        match try_portal(trigger, mic_ptt.clone(), log.clone(), portal_ready_clone).await {
+            Ok(()) => {}
+            Err(e) => {
+                log_msg(&log, &format!("PTT: portal failed: {e}"));
+                log_msg(&log, "PTT: falling back to evdev");
+                start_evdev(&combo, mic_ptt, log.clone());
+            }
+        }
+    });
+
+    // Timeout: if portal hasn't signaled ready in 3 seconds, start evdev
+    let log_timeout = log_clone.clone();
+    let combo_timeout = combo_str.to_string();
+    glib::timeout_add_local_once(Duration::from_secs(3), move || {
+        if !portal_ready.load(Ordering::Relaxed) {
+            log_msg(&log_timeout, "PTT: portal timed out, falling back to evdev");
+            start_evdev(&combo_timeout, mic_ptt_clone, log_timeout.clone());
+        }
+    });
+}
+
+// ── XDG Portal ──────────────────────────────────────────────────
+
+async fn try_portal(
+    trigger: String,
     mic_ptt: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
     log: SharedLog,
-) -> Option<JoinHandle<()>> {
-    let combo = match parse_combo(combo_str) {
-        Some(c) => c,
+    ready: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, GlobalShortcuts, NewShortcut};
+    use ashpd::desktop::CreateSessionOptions;
+
+    let shortcuts = GlobalShortcuts::new().await?;
+    let session = shortcuts
+        .create_session(CreateSessionOptions::default())
+        .await?;
+
+    let shortcut = NewShortcut::new("ptt", "Push to Talk")
+        .preferred_trigger(trigger.as_str());
+
+    let request = shortcuts
+        .bind_shortcuts(&session, &[shortcut], None, BindShortcutsOptions::default())
+        .await?;
+
+    let response = request.response()?;
+    let bound = response.shortcuts();
+
+    if bound.is_empty() {
+        return Err("compositor did not bind any shortcuts".into());
+    }
+
+    let desc = bound[0].trigger_description();
+    log_msg(&log, &format!("PTT: portal ready ({desc})"));
+    ready.store(true, Ordering::Relaxed);
+
+    let mic_press = mic_ptt.clone();
+    let mut activated = shortcuts.receive_activated().await?;
+    glib::spawn_future_local(async move {
+        while let Some(_) = activated.next().await {
+            mic_press.store(true, Ordering::Relaxed);
+        }
+    });
+
+    let mut deactivated = shortcuts.receive_deactivated().await?;
+    glib::spawn_future_local(async move {
+        while let Some(_) = deactivated.next().await {
+            mic_ptt.store(false, Ordering::Relaxed);
+        }
+    });
+
+    Ok(())
+}
+
+// ── evdev Fallback ──────────────────────────────────────────────
+
+fn parse_evdev_key(name: &str) -> Option<evdev::KeyCode> {
+    match name.to_uppercase().as_str() {
+        "SPACE" => Some(evdev::KeyCode::KEY_SPACE),
+        "F1" => Some(evdev::KeyCode::KEY_F1),
+        "F2" => Some(evdev::KeyCode::KEY_F2),
+        "F3" => Some(evdev::KeyCode::KEY_F3),
+        "F4" => Some(evdev::KeyCode::KEY_F4),
+        "F5" => Some(evdev::KeyCode::KEY_F5),
+        "F6" => Some(evdev::KeyCode::KEY_F6),
+        "F7" => Some(evdev::KeyCode::KEY_F7),
+        "F8" => Some(evdev::KeyCode::KEY_F8),
+        "F9" => Some(evdev::KeyCode::KEY_F9),
+        "F10" => Some(evdev::KeyCode::KEY_F10),
+        "F11" => Some(evdev::KeyCode::KEY_F11),
+        "F12" => Some(evdev::KeyCode::KEY_F12),
+        "CAPSLOCK" => Some(evdev::KeyCode::KEY_CAPSLOCK),
+        "SCROLLLOCK" => Some(evdev::KeyCode::KEY_SCROLLLOCK),
+        "PAUSE" => Some(evdev::KeyCode::KEY_PAUSE),
+        "INSERT" => Some(evdev::KeyCode::KEY_INSERT),
+        "HOME" => Some(evdev::KeyCode::KEY_HOME),
+        "END" => Some(evdev::KeyCode::KEY_END),
+        "PAGEUP" => Some(evdev::KeyCode::KEY_PAGEUP),
+        "PAGEDOWN" => Some(evdev::KeyCode::KEY_PAGEDOWN),
+        _ => None,
+    }
+}
+
+fn parse_evdev_modifier(name: &str) -> Option<(evdev::KeyCode, evdev::KeyCode)> {
+    match name.to_uppercase().as_str() {
+        "ALT" => Some((evdev::KeyCode::KEY_LEFTALT, evdev::KeyCode::KEY_RIGHTALT)),
+        "CTRL" | "CONTROL" => Some((evdev::KeyCode::KEY_LEFTCTRL, evdev::KeyCode::KEY_RIGHTCTRL)),
+        "SHIFT" => Some((evdev::KeyCode::KEY_LEFTSHIFT, evdev::KeyCode::KEY_RIGHTSHIFT)),
+        "SUPER" | "META" => Some((evdev::KeyCode::KEY_LEFTMETA, evdev::KeyCode::KEY_RIGHTMETA)),
+        _ => None,
+    }
+}
+
+fn start_evdev(combo_str: &str, mic_ptt: Arc<AtomicBool>, log: SharedLog) {
+    let parts: Vec<&str> = combo_str.split('+').collect();
+    let (modifier, key_name) = if parts.len() == 2 {
+        (parse_evdev_modifier(parts[0]), parts[1])
+    } else {
+        (None, parts[0])
+    };
+
+    let target_key = match parse_evdev_key(key_name) {
+        Some(k) => k,
         None => {
-            log_msg(&log, &format!("Unknown PTT combo: {combo_str}"));
-            return None;
+            log_msg(&log, &format!("PTT: unknown key: {key_name}"));
+            return;
         }
     };
 
-    let target_code = combo.key.0;
-    let modifier_codes = combo.modifier.map(|(l, r)| (l.0, r.0));
-    let combo_display = combo_str.to_string();
+    let target_code = target_key.0;
+    let modifier_codes = modifier.map(|(l, r)| (l.0, r.0));
+    let combo = combo_str.to_string();
 
-    let handle = thread::Builder::new()
-        .name("ptt-listener".into())
+    thread::Builder::new()
+        .name("ptt-evdev".into())
         .spawn(move || {
-            let mut keyboards: Vec<Device> = Vec::new();
+            let mut keyboards: Vec<evdev::Device> = Vec::new();
 
             for (_path, device) in evdev::enumerate() {
-                if device
-                    .supported_keys()
-                    .is_some_and(|keys| keys.contains(combo.key))
-                {
+                if device.supported_keys().is_some_and(|keys| keys.contains(target_key)) {
                     if let Some(name) = device.name() {
-                        log_msg(&log, &format!("PTT: monitoring {name} for {combo_display}"));
+                        log_msg(&log, &format!("PTT: evdev monitoring {name} for {combo}"));
                     }
                     keyboards.push(device);
                 }
             }
 
             if keyboards.is_empty() {
-                log_msg(&log, "PTT: no keyboard devices found");
+                log_msg(&log, "PTT: no keyboard devices found (need input group?)");
                 return;
             }
 
@@ -125,58 +203,45 @@ pub fn spawn_ptt_listener(
             let mut modifier_held = false;
             let mut key_held = false;
 
-            while !stop.load(Ordering::Relaxed) {
+            loop {
                 let mut any_event = false;
 
                 for kb in &mut keyboards {
                     if let Ok(events) = kb.fetch_events() {
                         for event in events {
-                            if event.event_type() != EventType::KEY {
+                            if event.event_type() != evdev::EventType::KEY {
                                 continue;
                             }
-
                             let code = event.code();
                             let pressed = event.value() == 1;
                             let released = event.value() == 0;
 
-                            // Track modifier state
                             if let Some((l, r)) = modifier_codes {
                                 if code == l || code == r {
-                                    if pressed {
-                                        modifier_held = true;
-                                    } else if released {
-                                        modifier_held = false;
-                                    }
+                                    if pressed { modifier_held = true; }
+                                    else if released { modifier_held = false; }
                                     any_event = true;
                                 }
                             }
 
-                            // Track key state
                             if code == target_code {
-                                if pressed {
-                                    key_held = true;
-                                } else if released {
-                                    key_held = false;
-                                }
+                                if pressed { key_held = true; }
+                                else if released { key_held = false; }
                                 any_event = true;
                             }
 
-                            // Update mic state: modifier must be held (if configured) + key held
-                            let active = key_held
-                                && (modifier_codes.is_none() || modifier_held);
+                            let active = key_held && (modifier_codes.is_none() || modifier_held);
                             mic_ptt.store(active, Ordering::Relaxed);
                         }
                     }
                 }
 
                 if !any_event {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(5));
                 }
             }
         })
-        .expect("Failed to spawn PTT listener thread");
-
-    Some(handle)
+        .expect("Failed to spawn evdev PTT thread");
 }
 
 #[cfg(test)]
@@ -184,44 +249,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_single_key() {
-        assert_eq!(parse_single_key("Space"), Some(KeyCode::KEY_SPACE));
-        assert_eq!(parse_single_key("F1"), Some(KeyCode::KEY_F1));
-        assert_eq!(parse_single_key("f12"), Some(KeyCode::KEY_F12));
-        assert_eq!(parse_single_key("CapsLock"), Some(KeyCode::KEY_CAPSLOCK));
-        assert_eq!(parse_single_key("nope"), None);
+    fn test_combo_to_xdg_trigger() {
+        assert_eq!(combo_to_xdg_trigger("Alt+Space"), "<Alt>space");
+        assert_eq!(combo_to_xdg_trigger("Ctrl+F1"), "<Ctrl>f1");
+        assert_eq!(combo_to_xdg_trigger("F5"), "f5");
     }
 
     #[test]
-    fn test_parse_modifier() {
-        let (l, r) = parse_modifier("Alt").unwrap();
-        assert_eq!(l, KeyCode::KEY_LEFTALT);
-        assert_eq!(r, KeyCode::KEY_RIGHTALT);
-        assert!(parse_modifier("ctrl").is_some());
-        assert!(parse_modifier("shift").is_some());
-        assert!(parse_modifier("super").is_some());
-        assert!(parse_modifier("nope").is_none());
+    fn test_parse_evdev_key() {
+        assert!(parse_evdev_key("Space").is_some());
+        assert!(parse_evdev_key("F12").is_some());
+        assert!(parse_evdev_key("nope").is_none());
     }
 
     #[test]
-    fn test_parse_combo_single() {
-        let c = parse_combo("F5").unwrap();
-        assert_eq!(c.key, KeyCode::KEY_F5);
-        assert!(c.modifier.is_none());
-    }
-
-    #[test]
-    fn test_parse_combo_with_modifier() {
-        let c = parse_combo("Alt+Space").unwrap();
-        assert_eq!(c.key, KeyCode::KEY_SPACE);
-        let (l, _) = c.modifier.unwrap();
-        assert_eq!(l, KeyCode::KEY_LEFTALT);
-    }
-
-    #[test]
-    fn test_parse_combo_invalid() {
-        assert!(parse_combo("").is_none());
-        assert!(parse_combo("Alt+Nope").is_none());
-        assert!(parse_combo("A+B+C").is_none());
+    fn test_parse_evdev_modifier() {
+        assert!(parse_evdev_modifier("Alt").is_some());
+        assert!(parse_evdev_modifier("Ctrl").is_some());
+        assert!(parse_evdev_modifier("nope").is_none());
     }
 }

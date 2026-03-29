@@ -29,11 +29,9 @@ pub(crate) struct AppState {
     pub mic_levels: SharedLevels,
     pub current_mic_device: String,
 
-    // PTT (two separate flags: toggle via button, hold via evdev)
+    // PTT (two separate flags: toggle via button, hold via portal)
     pub is_mic_toggled: Arc<AtomicBool>,
     pub is_mic_ptt: Arc<AtomicBool>,
-    pub ptt_thread: Option<JoinHandle<()>>,
-    pub ptt_stop: Option<Arc<AtomicBool>>,
 
     // Metadata
     pub metadata_thread: Option<JoinHandle<()>>,
@@ -70,8 +68,6 @@ impl Default for AppState {
 
             is_mic_toggled: Arc::new(AtomicBool::new(false)),
             is_mic_ptt: Arc::new(AtomicBool::new(false)),
-            ptt_thread: None,
-            ptt_stop: None,
 
             metadata_thread: None,
             metadata_stop: Arc::new(AtomicBool::new(false)),
@@ -189,22 +185,8 @@ pub(crate) fn stop_mic_capture(s: &mut AppState) {
     s.current_mic_device.clear();
 }
 
-pub(crate) fn start_ptt(s: &mut AppState, config: &Config) {
-    stop_ptt(s);
-    let ptt_stop = Arc::new(AtomicBool::new(false));
-    s.ptt_stop = Some(ptt_stop.clone());
-    s.ptt_thread = ptt::spawn_ptt_listener(
-        &config.ptt_key,
-        s.is_mic_ptt.clone(),
-        ptt_stop,
-        s.log.clone(),
-    );
-}
-
-pub(crate) fn stop_ptt(s: &mut AppState) {
-    if let Some(flag) = s.ptt_stop.take() { flag.store(true, Ordering::Relaxed); }
-    s.ptt_thread.take();
-    s.is_mic_ptt.store(false, Ordering::Relaxed);
+pub(crate) fn start_ptt(s: &AppState, config: &Config) {
+    ptt::start_ptt(&config.ptt_key, s.is_mic_ptt.clone(), s.log.clone());
 }
 
 /// Start streaming. Returns Err(message) if config is invalid.
@@ -304,6 +286,5 @@ pub(crate) fn shutdown(s: &mut AppState) {
     kill_pw(&s.pw_pid);
     if let Some(f) = s.mic_capture_stop.take() { f.store(true, Ordering::Relaxed); }
     kill_pw(&s.mic_pw_pid);
-    if let Some(f) = s.ptt_stop.take() { f.store(true, Ordering::Relaxed); }
     s.metadata_stop.store(true, Ordering::Relaxed);
 }
