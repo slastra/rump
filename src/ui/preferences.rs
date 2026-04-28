@@ -4,9 +4,11 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::config::Config;
+use crate::config::{Codec, Config};
 use crate::pipewire::PwDevice;
 use crate::ptt;
+
+const OPUS_BITRATE_OPTIONS: [u32; 5] = [64, 96, 128, 192, 256];
 
 pub(crate) fn open_preferences(parent: &adw::ApplicationWindow) {
     let config = Config::load();
@@ -53,21 +55,40 @@ pub(crate) fn open_preferences(parent: &adw::ApplicationWindow) {
     audio_page.append(&device_group);
 
     let encoding_group = adw::PreferencesGroup::builder().title("Encoding").build();
+
+    let codec_list = gtk4::StringList::new(&["Vorbis", "Opus"]);
+    let codec_row = adw::ComboRow::builder().title("Codec").model(&codec_list).build();
+    codec_row.set_selected(match config.codec { Codec::Opus => 1, Codec::Vorbis => 0 });
+
     let sr_list = gtk4::StringList::new(&["44100", "48000"]);
     let sr_row = adw::ComboRow::builder().title("Sample Rate").model(&sr_list).build();
     sr_row.set_selected(if config.sample_rate == 48000 { 1 } else { 0 });
     let ch_list = gtk4::StringList::new(&["Mono", "Stereo"]);
     let ch_row = adw::ComboRow::builder().title("Channels").model(&ch_list).build();
     ch_row.set_selected(if config.channels == 1 { 0 } else { 1 });
+
     let q_scale = gtk4::Scale::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .adjustment(&gtk4::Adjustment::new(config.vorbis_quality as f64, 0.0, 1.0, 0.1, 0.1, 0.0))
         .draw_value(true).digits(1).hexpand(true).valign(gtk4::Align::Center).build();
     let q_row = adw::ActionRow::builder().title("Vorbis Quality").build();
     q_row.add_suffix(&q_scale);
+
+    let br_labels: Vec<String> = OPUS_BITRATE_OPTIONS.iter().map(u32::to_string).collect();
+    let br_label_refs: Vec<&str> = br_labels.iter().map(String::as_str).collect();
+    let br_list = gtk4::StringList::new(&br_label_refs);
+    let br_row = adw::ComboRow::builder().title("Opus Bitrate (kbps)").model(&br_list).build();
+    br_row.set_selected(
+        OPUS_BITRATE_OPTIONS.iter()
+            .position(|&b| b == config.opus_bitrate_kbps)
+            .unwrap_or(2) as u32,
+    );
+
+    encoding_group.add(&codec_row);
     encoding_group.add(&sr_row);
     encoding_group.add(&ch_row);
     encoding_group.add(&q_row);
+    encoding_group.add(&br_row);
     audio_page.append(&encoding_group);
 
     let audio_scroll = gtk4::ScrolledWindow::builder().child(&audio_page).vexpand(true).build();
@@ -206,9 +227,12 @@ pub(crate) fn open_preferences(parent: &adw::ApplicationWindow) {
             mount: mount_row.text().to_string(),
             password: pass_row.text().to_string(),
             input_device,
+            codec: match codec_row.selected() { 1 => Codec::Opus, _ => Codec::Vorbis },
             sample_rate: match sr_row.selected() { 1 => 48000, _ => 44100 },
             channels: match ch_row.selected() { 0 => 1, _ => 2 },
             vorbis_quality: q_scale.value() as f32,
+            opus_bitrate_kbps: OPUS_BITRATE_OPTIONS
+                .get(br_row.selected() as usize).copied().unwrap_or(128),
             mic_device, ptt_key,
             duck_threshold: threshold_scale.value() as f32,
             duck_level: duck_level_scale.value() as f32,

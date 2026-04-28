@@ -4,6 +4,14 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Codec {
+    #[default]
+    Vorbis,
+    Opus,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -12,9 +20,11 @@ pub struct Config {
     pub mount: String,
     pub password: String,
     pub input_device: String,
+    pub codec: Codec,
     pub sample_rate: u32,
     pub channels: u16,
     pub vorbis_quality: f32,
+    pub opus_bitrate_kbps: u32,
     // Microphone
     pub mic_device: String,
     pub ptt_key: String,
@@ -34,9 +44,11 @@ impl Default for Config {
             mount: "/angelo".into(),
             password: String::new(),
             input_device: String::new(),
+            codec: Codec::Vorbis,
             sample_rate: 44100,
             channels: 2,
             vorbis_quality: 0.4,
+            opus_bitrate_kbps: 128,
             mic_device: String::new(),
             ptt_key: "Alt+Space".into(),
             duck_threshold: 0.02,
@@ -44,6 +56,17 @@ impl Default for Config {
             duck_attack_ms: 100,
             duck_release_ms: 800,
             duck_hold_ms: 500,
+        }
+    }
+}
+
+impl Config {
+    /// Sample rate to use for capture and encoding.
+    /// Opus is locked to 48 kHz; Vorbis uses the user's setting.
+    pub fn effective_sample_rate(&self) -> u32 {
+        match self.codec {
+            Codec::Opus => 48000,
+            Codec::Vorbis => self.sample_rate,
         }
     }
 }

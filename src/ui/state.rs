@@ -118,9 +118,11 @@ pub(crate) fn is_mic_active(s: &AppState) -> bool {
 pub(crate) fn start_capture(s: &mut AppState, serial: u32, config: &Config) {
     stop_capture(s);
     let audio_config = AudioConfig {
-        sample_rate: config.sample_rate,
+        codec: config.codec,
+        sample_rate: config.effective_sample_rate(),
         channels: config.channels,
         vorbis_quality: config.vorbis_quality,
+        opus_bitrate_kbps: config.opus_bitrate_kbps,
     };
     let (pcm_tx, pcm_rx) = crossbeam_channel::bounded(64);
     s.pcm_rx = Some(pcm_rx);
@@ -163,7 +165,7 @@ pub(crate) fn start_mic_capture(s: &mut AppState, serial: u32, config: &Config) 
     let is_streaming = s.is_streaming_flag.clone();
     let pw_pid = s.mic_pw_pid.clone();
     let log = s.log.clone();
-    let sample_rate = config.sample_rate;
+    let sample_rate = config.effective_sample_rate();
     s.mic_capture_thread = Some(
         thread::Builder::new()
             .name("mic-capture".into())
@@ -213,9 +215,11 @@ pub(crate) fn start_streaming(s: &mut AppState) -> Result<(), String> {
     let mic_rx = s.mic_rx.clone();
 
     let audio_config = AudioConfig {
-        sample_rate: config.sample_rate,
+        codec: config.codec,
+        sample_rate: config.effective_sample_rate(),
         channels: config.channels,
         vorbis_quality: config.vorbis_quality,
+        opus_bitrate_kbps: config.opus_bitrate_kbps,
     };
     let duck_config = DuckConfig {
         threshold: config.duck_threshold,

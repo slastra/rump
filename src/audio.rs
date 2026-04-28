@@ -9,16 +9,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
-use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
+use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBuilder};
 
+use crate::config::Codec;
 use crate::log::{SharedLog, log_msg};
 use crate::stream::{IcecastConfig, IcecastConnection, SharedMetadata};
 
 #[derive(Clone)]
 pub struct AudioConfig {
+    pub codec: Codec,
     pub sample_rate: u32,
     pub channels: u16,
     pub vorbis_quality: f32,
+    pub opus_bitrate_kbps: u32,
 }
 
 /// Ducking configuration (from user preferences).
@@ -292,6 +296,135 @@ pub fn run_mic_capture(
     Ok(())
 }
 
+// ── Opus / OGG ──────────────────────────────────────────────────
+
+const OPUS_FRAME_SIZE: usize = 960; // 20 ms at 48 kHz
+const OPUS_PACKET_MAX: usize = 4000;
+
+fn rand_stream_serial() -> u32 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+}
+
+/// Build OGG Opus headers per RFC 7845.
+fn build_opus_headers(channels: u16, sample_rate: u32, serial: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut writer = PacketWriter::new(&mut buf);
+
+    let mut head = Vec::with_capacity(19);
+    head.extend_from_slice(b"OpusHead");
+    head.push(1);
+    head.push(channels as u8);
+    head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
+    head.extend_from_slice(&sample_rate.to_le_bytes());
+    head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+    head.push(0); // channel mapping family
+    writer.write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
+        .expect("OGG write to Vec is infallible");
+
+    let mut tags = Vec::with_capacity(24);
+    tags.extend_from_slice(b"OpusTags");
+    let vendor = b"RUMP";
+    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    tags.extend_from_slice(vendor);
+    tags.extend_from_slice(&0u32.to_le_bytes()); // no user comments
+    writer.write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
+        .expect("OGG write to Vec is infallible");
+
+    buf
+}
+
+// ── Encoder ─────────────────────────────────────────────────────
+
+enum Encoder {
+    Vorbis(Box<VorbisState>),
+    Opus(OpusState),
+}
+
+struct VorbisState {
+    encoder: VorbisEncoder<OggSink>,
+    sink_buf: Rc<RefCell<Vec<u8>>>,
+}
+
+struct OpusState {
+    encoder: opus::Encoder,
+    serial: u32,
+    granule: u64,
+    pcm_buf: Vec<f32>,
+    packet_scratch: Vec<u8>,
+    channels: usize,
+}
+
+impl Encoder {
+    /// Encode one block of interleaved PCM and append OGG bytes to `out`.
+    fn encode(&mut self, music: &[f32], channels: u16, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Encoder::Vorbis(v) => {
+                let planar = deinterleave(music, channels);
+                let planar_refs: Vec<&[f32]> = planar.iter().map(|c| c.as_slice()).collect();
+                v.encoder.encode_audio_block(planar_refs).context("Vorbis encode failed")?;
+                let mut sink = v.sink_buf.borrow_mut();
+                out.extend_from_slice(&sink);
+                sink.clear();
+                Ok(())
+            }
+            Encoder::Opus(o) => {
+                o.pcm_buf.extend_from_slice(music);
+                let samples_per_frame = OPUS_FRAME_SIZE * o.channels;
+                let mut writer = PacketWriter::new(out);
+                while o.pcm_buf.len() >= samples_per_frame {
+                    let len = o.encoder.encode_float(&o.pcm_buf[..samples_per_frame], &mut o.packet_scratch)
+                        .context("Opus encode failed")?;
+                    o.pcm_buf.drain(..samples_per_frame);
+                    o.granule += OPUS_FRAME_SIZE as u64;
+                    writer.write_packet(
+                        o.packet_scratch[..len].to_vec(),
+                        o.serial,
+                        PacketWriteEndInfo::NormalPacket,
+                        o.granule,
+                    ).context("OGG write failed")?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Drain any pending state and append final OGG bytes (with end-of-stream marker for Opus).
+    fn finish(self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Encoder::Vorbis(v) => {
+                v.encoder.finish().context("Failed to finish Vorbis encoder")?;
+                out.extend_from_slice(&v.sink_buf.borrow());
+                Ok(())
+            }
+            Encoder::Opus(mut o) => {
+                let samples_per_frame = OPUS_FRAME_SIZE * o.channels;
+                if !o.pcm_buf.is_empty() && o.pcm_buf.len() < samples_per_frame {
+                    o.pcm_buf.resize(samples_per_frame, 0.0);
+                }
+                let mut writer = PacketWriter::new(out);
+                while o.pcm_buf.len() >= samples_per_frame {
+                    let len = o.encoder.encode_float(&o.pcm_buf[..samples_per_frame], &mut o.packet_scratch)
+                        .context("Opus encode failed")?;
+                    o.pcm_buf.drain(..samples_per_frame);
+                    o.granule += OPUS_FRAME_SIZE as u64;
+                    let info = if o.pcm_buf.is_empty() {
+                        PacketWriteEndInfo::EndStream
+                    } else {
+                        PacketWriteEndInfo::NormalPacket
+                    };
+                    writer.write_packet(o.packet_scratch[..len].to_vec(), o.serial, info, o.granule)
+                        .context("OGG write failed")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 // ── Stream with Mixing (on-demand) ──────────────────────────────
 
 pub fn run_stream(
@@ -307,24 +440,7 @@ pub fn run_stream(
     log: SharedLog,
     error_slot: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
-    log_msg(&log, &format!(
-        "Encoding: OGG Vorbis, {}Hz, {}ch, quality {:.1}",
-        audio_config.sample_rate, audio_config.channels, audio_config.vorbis_quality
-    ));
-
-    let (sink, sink_buffer) = OggSink::new();
-    let mut builder = VorbisEncoderBuilder::new(
-        NonZeroU32::new(audio_config.sample_rate).context("Invalid sample rate")?,
-        NonZeroU8::new(audio_config.channels as u8).context("Invalid channel count")?,
-        sink,
-    ).context("Failed to create Vorbis encoder builder")?;
-
-    builder.bitrate_management_strategy(VorbisBitrateManagementStrategy::QualityVbr {
-        target_quality: audio_config.vorbis_quality,
-    });
-
-    let mut encoder = builder.build().context("Failed to build Vorbis encoder")?;
-    let header_bytes: Vec<u8> = sink_buffer.borrow_mut().drain(..).collect();
+    let (encoder, header_bytes) = build_encoder(&audio_config, &log)?;
 
     let mut conn = IcecastConnection::connect(icecast_config.clone())?;
     log_msg(&log, "Connected to Icecast");
@@ -334,70 +450,56 @@ pub fn run_stream(
         log_msg(&log, "Streaming started");
     }
 
+    let mut encoder = encoder;
     let mut duck = DuckState::new();
     let frames_per_chunk = 512;
     let dt = frames_per_chunk as f32 / audio_config.sample_rate as f32;
+    let mut ogg_buf: Vec<u8> = Vec::with_capacity(8192);
 
     loop {
         if stop.load(Ordering::Relaxed) { break; }
 
-        // Receive music PCM (blocking with timeout)
         let mut music = match pcm_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(s) => s,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        // Try to receive mic PCM and mix
         let mic_active = is_mic_toggled.load(Ordering::Relaxed) || is_mic_ptt.load(Ordering::Relaxed);
         if let Some(ref mic_rx) = mic_rx {
             if let Ok(mic_samples) = mic_rx.try_recv() {
-                // Compute mic RMS for ducking
                 let (mic_rms, _) = compute_rms(&mic_samples, 1);
                 let gain = duck.update(mic_active, mic_rms, &duck_config, dt);
-
-                // Mix: apply gain to music, add mic (mono → stereo)
                 let channels = audio_config.channels as usize;
-                let music_frames = music.len() / channels;
-                let mic_frames = mic_samples.len();
-                let frames = music_frames.min(mic_frames);
-
+                let frames = (music.len() / channels).min(mic_samples.len());
                 for i in 0..frames {
                     let mic_sample = if mic_active { mic_samples[i] } else { 0.0 };
                     for ch in 0..channels {
                         music[i * channels + ch] = music[i * channels + ch] * gain + mic_sample;
                     }
                 }
-                // Apply gain to any remaining music frames (beyond mic data)
                 for i in (frames * channels)..(music.len()) {
                     music[i] *= gain;
                 }
             } else {
-                // No mic data — just update duck state toward release
                 let gain = duck.update(false, 0.0, &duck_config, dt);
                 if gain < 1.0 {
-                    for s in &mut music {
-                        *s *= gain;
-                    }
+                    for s in &mut music { *s *= gain; }
                 }
             }
         }
 
-        // Encode
-        let planar = deinterleave(&music, audio_config.channels);
-        let planar_refs: Vec<&[f32]> = planar.iter().map(|ch| ch.as_slice()).collect();
-        encoder.encode_audio_block(planar_refs).context("Vorbis encode failed")?;
+        ogg_buf.clear();
+        encoder.encode(&music, audio_config.channels, &mut ogg_buf)?;
 
-        let ogg_bytes: Vec<u8> = sink_buffer.borrow_mut().drain(..).collect();
-        if !ogg_bytes.is_empty() {
-            if let Err(e) = conn.send(&ogg_bytes) {
+        if !ogg_buf.is_empty() {
+            if let Err(e) = conn.send(&ogg_buf) {
                 log_msg(&log, &format!("Send failed: {e}, reconnecting..."));
                 conn = reconnect_icecast(&icecast_config, &header_bytes, &log, &stop)?;
-                conn.send(&ogg_bytes).context("Failed to send after reconnection")?;
+                conn.send(&ogg_buf).context("Failed to send after reconnection")?;
             }
         }
 
-        // Metadata
         if let Ok(mut meta) = metadata.lock() {
             if meta.changed {
                 meta.changed = false;
@@ -414,16 +516,64 @@ pub fn run_stream(
         }
     }
 
-    encoder.finish().context("Failed to finish Vorbis encoder")?;
-    let final_bytes: Vec<u8> = sink_buffer.borrow_mut().drain(..).collect();
-    if !final_bytes.is_empty() {
-        let _ = conn.send(&final_bytes);
+    ogg_buf.clear();
+    encoder.finish(&mut ogg_buf)?;
+    if !ogg_buf.is_empty() {
+        let _ = conn.send(&ogg_buf);
     }
 
     if let Ok(mut err) = error_slot.lock() {
         *err = None;
     }
     Ok(())
+}
+
+fn build_encoder(audio_config: &AudioConfig, log: &SharedLog) -> Result<(Encoder, Vec<u8>)> {
+    match audio_config.codec {
+        Codec::Opus => {
+            log_msg(log, &format!(
+                "Encoding: OGG Opus, {}Hz, {}ch, {}kbps",
+                audio_config.sample_rate, audio_config.channels, audio_config.opus_bitrate_kbps
+            ));
+            let channels = match audio_config.channels {
+                1 => opus::Channels::Mono,
+                _ => opus::Channels::Stereo,
+            };
+            let mut enc = opus::Encoder::new(audio_config.sample_rate, channels, opus::Application::Audio)
+                .context("Failed to create Opus encoder")?;
+            enc.set_bitrate(opus::Bitrate::Bits((audio_config.opus_bitrate_kbps * 1000) as i32))
+                .context("Failed to set Opus bitrate")?;
+            let serial = rand_stream_serial();
+            let headers = build_opus_headers(audio_config.channels, audio_config.sample_rate, serial);
+            let encoder = Encoder::Opus(OpusState {
+                encoder: enc,
+                serial,
+                granule: 0,
+                pcm_buf: Vec::with_capacity(OPUS_FRAME_SIZE * audio_config.channels as usize * 2),
+                packet_scratch: vec![0u8; OPUS_PACKET_MAX],
+                channels: audio_config.channels as usize,
+            });
+            Ok((encoder, headers))
+        }
+        Codec::Vorbis => {
+            log_msg(log, &format!(
+                "Encoding: OGG Vorbis, {}Hz, {}ch, quality {:.1}",
+                audio_config.sample_rate, audio_config.channels, audio_config.vorbis_quality
+            ));
+            let (sink, sink_buf) = OggSink::new();
+            let mut builder = VorbisEncoderBuilder::new(
+                NonZeroU32::new(audio_config.sample_rate).context("Invalid sample rate")?,
+                NonZeroU8::new(audio_config.channels as u8).context("Invalid channel count")?,
+                sink,
+            ).context("Failed to create Vorbis encoder builder")?;
+            builder.bitrate_management_strategy(VorbisBitrateManagementStrategy::QualityVbr {
+                target_quality: audio_config.vorbis_quality,
+            });
+            let encoder = builder.build().context("Failed to build Vorbis encoder")?;
+            let headers: Vec<u8> = sink_buf.borrow_mut().drain(..).collect();
+            Ok((Encoder::Vorbis(Box::new(VorbisState { encoder, sink_buf })), headers))
+        }
+    }
 }
 
 #[cfg(test)]
