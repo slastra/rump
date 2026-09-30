@@ -1,6 +1,6 @@
 # Maintainer: Shaun Lastra <shaun@lastra.us>
 pkgname=rump
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='Icecast streaming client with GTK4 UI, DJ mic mixing, and auto-ducking'
 arch=('x86_64')
