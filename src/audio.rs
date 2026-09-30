@@ -14,7 +14,7 @@ use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoder, VorbisEncoderBui
 
 use crate::config::Codec;
 use crate::log::{SharedLog, log_msg};
-use crate::stream::{IcecastConfig, IcecastConnection, SharedMetadata};
+use crate::stream::{IcecastConfig, IcecastConnection, SharedMetadata, TrackMetadata, send_admin_metadata};
 
 #[derive(Clone)]
 pub struct AudioConfig {
@@ -85,6 +85,22 @@ fn spawn_pw_record(target_serial: u32, rate: u32, channels: u16) -> Result<Child
         .context("Failed to spawn pw-record. Is PipeWire installed?")
 }
 
+/// Frames per capture chunk. Whole chunks keep L/R aligned (a short pipe read
+/// can end mid-frame) and give the ducker a fixed time step.
+const CHUNK_FRAMES: usize = 512;
+
+/// Fill `buf` exactly. Ok(false) when pw-record has exited.
+fn read_chunk(src: &mut impl Read, buf: &mut [u8], log: &SharedLog, what: &str) -> Result<bool> {
+    match src.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            log_msg(log, &format!("{what} exited"));
+            Ok(false)
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to read from {what}")),
+    }
+}
+
 fn compute_rms(samples: &[f32], channels: u16) -> (f32, f32) {
     if samples.is_empty() || channels == 0 {
         return (0.0, 0.0);
@@ -126,34 +142,48 @@ fn bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Sleep up to `d`, returning early (false) if `stop` is raised.
+fn sleep_unless_stopped(d: Duration, stop: &AtomicBool) -> bool {
+    let step = Duration::from_millis(100);
+    let mut left = d;
+    while !left.is_zero() {
+        if stop.load(Ordering::Relaxed) { return false; }
+        let s = left.min(step);
+        std::thread::sleep(s);
+        left -= s;
+    }
+    !stop.load(Ordering::Relaxed)
+}
+
+/// Reconnect until it works or the user stops the stream. An uplink that
+/// gives up after a few seconds turns a server restart into dead air.
 fn reconnect_icecast(
     config: &IcecastConfig,
     headers: &[u8],
     log: &SharedLog,
     stop: &AtomicBool,
 ) -> Result<IcecastConnection> {
-    const MAX_RETRIES: u32 = 5;
-    const RETRY_DELAY: Duration = Duration::from_secs(2);
+    const MAX_DELAY: Duration = Duration::from_secs(30);
+    let mut delay = Duration::from_secs(2);
 
-    for attempt in 1..=MAX_RETRIES {
-        if stop.load(Ordering::Relaxed) {
+    for attempt in 1.. {
+        log_msg(log, &format!("Reconnecting in {}s (attempt {attempt})...", delay.as_secs()));
+        if !sleep_unless_stopped(delay, stop) {
             anyhow::bail!("Reconnection cancelled");
         }
-        log_msg(log, &format!("Reconnecting (attempt {attempt}/{MAX_RETRIES})..."));
-        std::thread::sleep(RETRY_DELAY);
-
-        match IcecastConnection::connect(config.clone()) {
-            Ok(mut conn) => {
-                if !headers.is_empty() {
-                    conn.send(headers).context("Failed to re-send OGG headers")?;
+        match IcecastConnection::connect(config) {
+            Ok(mut conn) => match conn.send(headers) {
+                Ok(()) => {
+                    log_msg(log, "Reconnected");
+                    return Ok(conn);
                 }
-                log_msg(log, "Reconnected successfully");
-                return Ok(conn);
-            }
-            Err(e) => log_msg(log, &format!("Reconnect failed: {e}")),
+                Err(e) => log_msg(log, &format!("Reconnect failed: {e:#}")),
+            },
+            Err(e) => log_msg(log, &format!("Reconnect failed: {e:#}")),
         }
+        delay = (delay * 2).min(MAX_DELAY);
     }
-    anyhow::bail!("Failed to reconnect after {MAX_RETRIES} attempts")
+    unreachable!()
 }
 
 // ── Ducking State ───────────────────────────────────────────────
@@ -200,6 +230,7 @@ impl DuckState {
 
 // ── Music Capture (always-on) ───────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_capture(
     target_serial: u32,
     audio_config: AudioConfig,
@@ -215,20 +246,14 @@ pub fn run_capture(
     pw_pid.store(pw_child.id(), Ordering::Relaxed);
 
     let mut pw_stdout = pw_child.stdout.take().context("Failed to get pw-record stdout")?;
-    let buf_size = 512 * audio_config.channels as usize * 4;
-    let mut read_buf = vec![0u8; buf_size];
+    let mut read_buf = vec![0u8; CHUNK_FRAMES * audio_config.channels as usize * 4];
 
     loop {
         if stop.load(Ordering::Relaxed) { break; }
 
-        let n = match pw_stdout.read(&mut read_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("Failed to read from pw-record"),
-        };
+        if !read_chunk(&mut pw_stdout, &mut read_buf, &log, "pw-record")? { break; }
 
-        let samples = bytes_to_samples(&read_buf[..n]);
+        let samples = bytes_to_samples(&read_buf);
         let (left, right) = compute_rms(&samples, audio_config.channels);
         if let Ok(mut lvl) = levels.lock() {
             lvl.left = left;
@@ -249,6 +274,7 @@ pub fn run_capture(
 
 // ── Mic Capture (always-on when configured) ─────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_mic_capture(
     target_serial: u32,
     sample_rate: u32,
@@ -264,20 +290,14 @@ pub fn run_mic_capture(
     pw_pid.store(pw_child.id(), Ordering::Relaxed);
 
     let mut pw_stdout = pw_child.stdout.take().context("Failed to get mic pw-record stdout")?;
-    let buf_size = 512 * 4; // mono f32
-    let mut read_buf = vec![0u8; buf_size];
+    let mut read_buf = vec![0u8; CHUNK_FRAMES * 4]; // mono f32
 
     loop {
         if stop.load(Ordering::Relaxed) { break; }
 
-        let n = match pw_stdout.read(&mut read_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e).context("Failed to read from mic pw-record"),
-        };
+        if !read_chunk(&mut pw_stdout, &mut read_buf, &log, "mic pw-record")? { break; }
 
-        let samples = bytes_to_samples(&read_buf[..n]);
+        let samples = bytes_to_samples(&read_buf);
         let (rms, _) = compute_rms(&samples, 1);
         if let Ok(mut lvl) = levels.lock() {
             lvl.left = rms;
@@ -300,6 +320,9 @@ pub fn run_mic_capture(
 
 const OPUS_FRAME_SIZE: usize = 960; // 20 ms at 48 kHz
 const OPUS_PACKET_MAX: usize = 4000;
+/// Close an OGG page every 5 packets (100 ms). The writer only emits a page
+/// when one is closed, so this bounds both latency and burst size.
+const OPUS_PACKETS_PER_PAGE: u32 = 5;
 
 fn rand_stream_serial() -> u32 {
     use std::time::SystemTime;
@@ -309,32 +332,46 @@ fn rand_stream_serial() -> u32 {
         .subsec_nanos()
 }
 
-/// Build OGG Opus headers per RFC 7845.
-fn build_opus_headers(channels: u16, sample_rate: u32, serial: u32) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut writer = PacketWriter::new(&mut buf);
-
+/// Write the OGG Opus header pages (RFC 7845) through the stream's writer,
+/// so the audio pages that follow continue its page sequence.
+fn write_opus_headers(
+    writer: &mut PacketWriter<'static, Vec<u8>>,
+    channels: u16,
+    sample_rate: u32,
+    pre_skip: u16,
+    serial: u32,
+    meta: &TrackMetadata,
+) {
     let mut head = Vec::with_capacity(19);
     head.extend_from_slice(b"OpusHead");
     head.push(1);
     head.push(channels as u8);
-    head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
+    head.extend_from_slice(&pre_skip.to_le_bytes());
     head.extend_from_slice(&sample_rate.to_le_bytes());
     head.extend_from_slice(&0i16.to_le_bytes()); // output gain
     head.push(0); // channel mapping family
     writer.write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
         .expect("OGG write to Vec is infallible");
 
-    let mut tags = Vec::with_capacity(24);
+    // Titles travel here: Icecast's updinfo does not reach Ogg Opus
+    // listeners, so a track change starts a new chained stream (run_stream).
+    let comments: Vec<String> = [("TITLE", &meta.title), ("ARTIST", &meta.artist)]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let mut tags = Vec::with_capacity(64);
     tags.extend_from_slice(b"OpusTags");
     let vendor = b"RUMP";
     tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
     tags.extend_from_slice(vendor);
-    tags.extend_from_slice(&0u32.to_le_bytes()); // no user comments
+    tags.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for c in &comments {
+        tags.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        tags.extend_from_slice(c.as_bytes());
+    }
     writer.write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
         .expect("OGG write to Vec is infallible");
-
-    buf
 }
 
 // ── Encoder ─────────────────────────────────────────────────────
@@ -351,8 +388,13 @@ struct VorbisState {
 
 struct OpusState {
     encoder: opus::Encoder,
+    /// Lives for the whole stream: it buffers packets until a page is closed,
+    /// and carries the page sequence number. A writer per encode() call would
+    /// drop every packet it had not yet paged out.
+    writer: PacketWriter<'static, Vec<u8>>,
     serial: u32,
     granule: u64,
+    packets_in_page: u32,
     pcm_buf: Vec<f32>,
     packet_scratch: Vec<u8>,
     channels: usize,
@@ -374,19 +416,22 @@ impl Encoder {
             Encoder::Opus(o) => {
                 o.pcm_buf.extend_from_slice(music);
                 let samples_per_frame = OPUS_FRAME_SIZE * o.channels;
-                let mut writer = PacketWriter::new(out);
                 while o.pcm_buf.len() >= samples_per_frame {
                     let len = o.encoder.encode_float(&o.pcm_buf[..samples_per_frame], &mut o.packet_scratch)
                         .context("Opus encode failed")?;
                     o.pcm_buf.drain(..samples_per_frame);
                     o.granule += OPUS_FRAME_SIZE as u64;
-                    writer.write_packet(
-                        o.packet_scratch[..len].to_vec(),
-                        o.serial,
-                        PacketWriteEndInfo::NormalPacket,
-                        o.granule,
-                    ).context("OGG write failed")?;
+                    o.packets_in_page += 1;
+                    let info = if o.packets_in_page >= OPUS_PACKETS_PER_PAGE {
+                        o.packets_in_page = 0;
+                        PacketWriteEndInfo::EndPage
+                    } else {
+                        PacketWriteEndInfo::NormalPacket
+                    };
+                    o.writer.write_packet(o.packet_scratch[..len].to_vec(), o.serial, info, o.granule)
+                        .context("OGG write failed")?;
                 }
+                out.append(o.writer.inner_mut());
                 Ok(())
             }
         }
@@ -401,11 +446,12 @@ impl Encoder {
                 Ok(())
             }
             Encoder::Opus(mut o) => {
+                // Pad to whole frames, and to at least one: the end-of-stream
+                // flag rides on a packet, and it also flushes any packets
+                // still waiting in the current page.
                 let samples_per_frame = OPUS_FRAME_SIZE * o.channels;
-                if !o.pcm_buf.is_empty() && o.pcm_buf.len() < samples_per_frame {
-                    o.pcm_buf.resize(samples_per_frame, 0.0);
-                }
-                let mut writer = PacketWriter::new(out);
+                let frames = o.pcm_buf.len().div_ceil(samples_per_frame).max(1);
+                o.pcm_buf.resize(frames * samples_per_frame, 0.0);
                 while o.pcm_buf.len() >= samples_per_frame {
                     let len = o.encoder.encode_float(&o.pcm_buf[..samples_per_frame], &mut o.packet_scratch)
                         .context("Opus encode failed")?;
@@ -416,9 +462,10 @@ impl Encoder {
                     } else {
                         PacketWriteEndInfo::NormalPacket
                     };
-                    writer.write_packet(o.packet_scratch[..len].to_vec(), o.serial, info, o.granule)
+                    o.writer.write_packet(o.packet_scratch[..len].to_vec(), o.serial, info, o.granule)
                         .context("OGG write failed")?;
                 }
+                out.append(o.writer.inner_mut());
                 Ok(())
             }
         }
@@ -427,6 +474,9 @@ impl Encoder {
 
 // ── Stream with Mixing (on-demand) ──────────────────────────────
 
+/// Stream until stopped. Stopping mid-reconnect surfaces as an error from
+/// the loop; that is a normal exit, not a failure to show the user.
+#[allow(clippy::too_many_arguments)]
 pub fn run_stream(
     audio_config: AudioConfig,
     icecast_config: IcecastConfig,
@@ -440,20 +490,43 @@ pub fn run_stream(
     log: SharedLog,
     error_slot: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
-    let (encoder, header_bytes) = build_encoder(&audio_config, &log)?;
-
-    let mut conn = IcecastConnection::connect(icecast_config.clone())?;
-    log_msg(&log, "Connected to Icecast");
-
-    if !header_bytes.is_empty() {
-        conn.send(&header_bytes).context("Failed to send OGG headers")?;
-        log_msg(&log, "Streaming started");
+    let stopped = stop.clone();
+    match stream_loop(audio_config, icecast_config, pcm_rx, mic_rx, is_mic_toggled, is_mic_ptt, duck_config, metadata, stop, log, error_slot) {
+        Err(_) if stopped.load(Ordering::Relaxed) => Ok(()),
+        r => r,
     }
+}
 
-    let mut encoder = encoder;
+#[allow(clippy::too_many_arguments)]
+fn stream_loop(
+    audio_config: AudioConfig,
+    icecast_config: IcecastConfig,
+    pcm_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    mic_rx: Option<crossbeam_channel::Receiver<Vec<f32>>>,
+    is_mic_toggled: Arc<AtomicBool>,
+    is_mic_ptt: Arc<AtomicBool>,
+    duck_config: DuckConfig,
+    metadata: SharedMetadata,
+    stop: Arc<AtomicBool>,
+    log: SharedLog,
+    error_slot: Arc<Mutex<Option<String>>>,
+) -> Result<()> {
+    log_msg(&log, &describe(&audio_config));
+
+    // The title playing at connect time goes into the first OpusTags.
+    let initial = take_metadata(&metadata, true).unwrap_or_default();
+    let (mut encoder, mut header_bytes) = build_encoder(&audio_config, &initial)?;
+
+    let mut conn = IcecastConnection::connect(&icecast_config)?;
+    log_msg(&log, "Connected to Icecast");
+    conn.send(&header_bytes).context("Failed to send OGG headers")?;
+    log_msg(&log, "Streaming started");
+
+    let mut sent_song = String::new();
+    announce(&initial, &mut sent_song, &encoder, &icecast_config, &log);
+
     let mut duck = DuckState::new();
-    let frames_per_chunk = 512;
-    let dt = frames_per_chunk as f32 / audio_config.sample_rate as f32;
+    let dt = CHUNK_FRAMES as f32 / audio_config.sample_rate as f32;
     let mut ogg_buf: Vec<u8> = Vec::with_capacity(8192);
 
     loop {
@@ -478,8 +551,8 @@ pub fn run_stream(
                         music[i * channels + ch] = music[i * channels + ch] * gain + mic_sample;
                     }
                 }
-                for i in (frames * channels)..(music.len()) {
-                    music[i] *= gain;
+                for s in &mut music[frames * channels..] {
+                    *s *= gain;
                 }
             } else {
                 let gain = duck.update(false, 0.0, &duck_config, dt);
@@ -491,26 +564,25 @@ pub fn run_stream(
 
         ogg_buf.clear();
         encoder.encode(&music, audio_config.channels, &mut ogg_buf)?;
-
         if !ogg_buf.is_empty() {
-            if let Err(e) = conn.send(&ogg_buf) {
-                log_msg(&log, &format!("Send failed: {e}, reconnecting..."));
-                conn = reconnect_icecast(&icecast_config, &header_bytes, &log, &stop)?;
-                conn.send(&ogg_buf).context("Failed to send after reconnection")?;
-            }
+            send_or_reconnect(&mut conn, &ogg_buf, &icecast_config, &header_bytes, &log, &stop)?;
         }
 
-        if let Ok(mut meta) = metadata.lock() {
-            if meta.changed {
-                meta.changed = false;
-                let snap = meta.clone();
-                drop(meta);
-                let song = snap.display_string();
-                if !song.is_empty() {
-                    log_msg(&log, &format!("Now playing: {song}"));
-                }
-                if let Err(e) = conn.update_metadata(&snap) {
-                    log_msg(&log, &format!("Metadata update failed: {e}"));
+        if let Some(meta) = take_metadata(&metadata, false) {
+            if announce(&meta, &mut sent_song, &encoder, &icecast_config, &log)
+                && matches!(encoder, Encoder::Opus(_))
+            {
+                // Chain a new logical stream: end the current one, then
+                // headers whose OpusTags carry the new title.
+                let (next, headers) = build_encoder(&audio_config, &meta)?;
+                ogg_buf.clear();
+                std::mem::replace(&mut encoder, next).finish(&mut ogg_buf)?;
+                send_or_reconnect(&mut conn, &ogg_buf, &icecast_config, &header_bytes, &log, &stop)?;
+                header_bytes = headers;
+                if let Err(e) = conn.send(&header_bytes) {
+                    log_msg(&log, &format!("Send failed: {e:#}"));
+                    // A reconnect sends the (new) headers itself.
+                    conn = reconnect_icecast(&icecast_config, &header_bytes, &log, &stop)?;
                 }
             }
         }
@@ -528,13 +600,74 @@ pub fn run_stream(
     Ok(())
 }
 
-fn build_encoder(audio_config: &AudioConfig, log: &SharedLog) -> Result<(Encoder, Vec<u8>)> {
+/// Send, and on failure reconnect (which re-sends `headers`) and resend.
+fn send_or_reconnect(
+    conn: &mut IcecastConnection,
+    data: &[u8],
+    config: &IcecastConfig,
+    headers: &[u8],
+    log: &SharedLog,
+    stop: &AtomicBool,
+) -> Result<()> {
+    if let Err(e) = conn.send(data) {
+        log_msg(log, &format!("Send failed: {e:#}"));
+        *conn = reconnect_icecast(config, headers, log, stop)?;
+        conn.send(data).context("Failed to send after reconnection")?;
+    }
+    Ok(())
+}
+
+/// Take a metadata snapshot if it changed (or unconditionally with `always`),
+/// clearing the changed flag.
+fn take_metadata(metadata: &SharedMetadata, always: bool) -> Option<TrackMetadata> {
+    let mut m = metadata.lock().ok()?;
+    if !always && !m.changed { return None; }
+    m.changed = false;
+    Some(m.clone())
+}
+
+/// Log a new title and, for Vorbis, push it to Icecast's admin interface on a
+/// side thread (it opens a connection; the audio loop must not wait on it).
+/// Returns false when there is nothing new to announce: playerctl repeats
+/// itself on play/pause, and each Opus announcement costs a stream chain.
+fn announce(
+    meta: &TrackMetadata,
+    sent_song: &mut String,
+    encoder: &Encoder,
+    config: &IcecastConfig,
+    log: &SharedLog,
+) -> bool {
+    let song = meta.display_string();
+    if song.is_empty() || song == *sent_song { return false; }
+    *sent_song = song.clone();
+    log_msg(log, &format!("Now playing: {song}"));
+    if matches!(encoder, Encoder::Vorbis(_)) {
+        let (config, log) = (config.clone(), log.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = send_admin_metadata(&config, &song) {
+                log_msg(&log, &format!("Metadata update failed: {e:#}"));
+            }
+        });
+    }
+    true
+}
+
+fn describe(audio_config: &AudioConfig) -> String {
+    match audio_config.codec {
+        Codec::Opus => format!(
+            "Encoding: OGG Opus, {}Hz, {}ch, {}kbps",
+            audio_config.sample_rate, audio_config.channels, audio_config.opus_bitrate_kbps
+        ),
+        Codec::Vorbis => format!(
+            "Encoding: OGG Vorbis, {}Hz, {}ch, quality {:.1}",
+            audio_config.sample_rate, audio_config.channels, audio_config.vorbis_quality
+        ),
+    }
+}
+
+fn build_encoder(audio_config: &AudioConfig, meta: &TrackMetadata) -> Result<(Encoder, Vec<u8>)> {
     match audio_config.codec {
         Codec::Opus => {
-            log_msg(log, &format!(
-                "Encoding: OGG Opus, {}Hz, {}ch, {}kbps",
-                audio_config.sample_rate, audio_config.channels, audio_config.opus_bitrate_kbps
-            ));
             let channels = match audio_config.channels {
                 1 => opus::Channels::Mono,
                 _ => opus::Channels::Stereo,
@@ -543,12 +676,19 @@ fn build_encoder(audio_config: &AudioConfig, log: &SharedLog) -> Result<(Encoder
                 .context("Failed to create Opus encoder")?;
             enc.set_bitrate(opus::Bitrate::Bits((audio_config.opus_bitrate_kbps * 1000) as i32))
                 .context("Failed to set Opus bitrate")?;
+            enc.set_signal(opus::Signal::Music).context("Failed to set Opus signal type")?;
+            // Decoders drop this many leading samples: the encoder's warm-up.
+            let pre_skip = enc.get_lookahead().context("Failed to read Opus lookahead")? as u16;
             let serial = rand_stream_serial();
-            let headers = build_opus_headers(audio_config.channels, audio_config.sample_rate, serial);
+            let mut writer = PacketWriter::new(Vec::new());
+            write_opus_headers(&mut writer, audio_config.channels, audio_config.sample_rate, pre_skip, serial, meta);
+            let headers = std::mem::take(writer.inner_mut());
             let encoder = Encoder::Opus(OpusState {
                 encoder: enc,
+                writer,
                 serial,
                 granule: 0,
+                packets_in_page: 0,
                 pcm_buf: Vec::with_capacity(OPUS_FRAME_SIZE * audio_config.channels as usize * 2),
                 packet_scratch: vec![0u8; OPUS_PACKET_MAX],
                 channels: audio_config.channels as usize,
@@ -556,10 +696,6 @@ fn build_encoder(audio_config: &AudioConfig, log: &SharedLog) -> Result<(Encoder
             Ok((encoder, headers))
         }
         Codec::Vorbis => {
-            log_msg(log, &format!(
-                "Encoding: OGG Vorbis, {}Hz, {}ch, quality {:.1}",
-                audio_config.sample_rate, audio_config.channels, audio_config.vorbis_quality
-            ));
             let (sink, sink_buf) = OggSink::new();
             let mut builder = VorbisEncoderBuilder::new(
                 NonZeroU32::new(audio_config.sample_rate).context("Invalid sample rate")?,
@@ -579,6 +715,91 @@ fn build_encoder(audio_config: &AudioConfig, log: &SharedLog) -> Result<(Encoder
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split an OGG byte stream into (header_type, granule, sequence) per page.
+    fn ogg_pages(bytes: &[u8]) -> Vec<(u8, u64, u32)> {
+        let mut pages = Vec::new();
+        let mut i = 0;
+        while i + 27 <= bytes.len() {
+            assert_eq!(&bytes[i..i + 4], b"OggS", "page misaligned at {i}");
+            let segs = bytes[i + 26] as usize;
+            let body: usize = bytes[i + 27..i + 27 + segs].iter().map(|&b| b as usize).sum();
+            let granule = u64::from_le_bytes(bytes[i + 6..i + 14].try_into().unwrap());
+            let seq = u32::from_le_bytes(bytes[i + 18..i + 22].try_into().unwrap());
+            pages.push((bytes[i + 5], granule, seq));
+            i += 27 + segs + body;
+        }
+        assert_eq!(i, bytes.len(), "trailing partial page");
+        pages
+    }
+
+    #[test]
+    fn test_opus_stream_emits_audio_pages() {
+        let cfg = AudioConfig {
+            codec: Codec::Opus, sample_rate: 48000, channels: 2,
+            vorbis_quality: 0.4, opus_bitrate_kbps: 128,
+        };
+        let (mut enc, headers) = build_encoder(&cfg, &TrackMetadata::default()).unwrap();
+        let mut stream = headers.clone();
+
+        // One second in the 512-frame chunks run_capture delivers.
+        let chunk: Vec<f32> = (0..512 * 2).map(|i| ((i as f32) * 0.05).sin() * 0.3).collect();
+        let mut out = Vec::new();
+        let mut sent_before_finish = 0;
+        for _ in 0..(48000 / 512) {
+            out.clear();
+            enc.encode(&chunk, 2, &mut out).unwrap();
+            sent_before_finish += out.len();
+            stream.extend_from_slice(&out);
+        }
+        out.clear();
+        enc.finish(&mut out).unwrap();
+        stream.extend_from_slice(&out);
+
+        // Audio must leave while streaming, not only at finish().
+        assert!(sent_before_finish > 10_000, "only {sent_before_finish} bytes during streaming");
+
+        let pages = ogg_pages(&stream);
+        assert_eq!(pages[0].0 & 0x02, 0x02, "first page is BOS");
+        assert!(pages.len() >= 2 + 9, "expected ~10 audio pages, got {}", pages.len() - 2);
+        for (k, p) in pages.iter().enumerate() {
+            assert_eq!(p.2 as usize, k, "page sequence must be continuous");
+            if k > 0 { assert_eq!(p.0 & 0x02, 0, "only the first page is BOS"); }
+        }
+        assert_eq!(pages.last().unwrap().0 & 0x04, 0x04, "last page is EOS");
+        let granules: Vec<u64> = pages[2..].iter().map(|p| p.1).collect();
+        assert!(granules.windows(2).all(|w| w[0] < w[1]), "granules increase");
+    }
+
+    #[test]
+    fn test_opus_title_change_chains_stream() {
+        let cfg = AudioConfig {
+            codec: Codec::Opus, sample_rate: 48000, channels: 2,
+            vorbis_quality: 0.4, opus_bitrate_kbps: 96,
+        };
+        let a = TrackMetadata { artist: "Angelo".into(), title: "First".into(), changed: false };
+        let b = TrackMetadata { artist: String::new(), title: "It's Two".into(), changed: false };
+        let chunk: Vec<f32> = (0..CHUNK_FRAMES * 2).map(|i| ((i as f32) * 0.03).sin() * 0.3).collect();
+
+        let (mut enc, mut stream) = build_encoder(&cfg, &a).unwrap();
+        for _ in 0..40 { enc.encode(&chunk, 2, &mut stream).unwrap(); }
+        // What run_stream does on a title change.
+        let (next, headers) = build_encoder(&cfg, &b).unwrap();
+        std::mem::replace(&mut enc, next).finish(&mut stream).unwrap();
+        stream.extend_from_slice(&headers);
+        for _ in 0..40 { enc.encode(&chunk, 2, &mut stream).unwrap(); }
+        enc.finish(&mut stream).unwrap();
+
+        if let Ok(path) = std::env::var("RUMP_DUMP_OGG") { std::fs::write(path, &stream).unwrap(); }
+
+        let pages = ogg_pages(&stream);
+        let bos: Vec<usize> = pages.iter().enumerate().filter(|(_, p)| p.0 & 0x02 != 0).map(|(i, _)| i).collect();
+        let eos: Vec<usize> = pages.iter().enumerate().filter(|(_, p)| p.0 & 0x04 != 0).map(|(i, _)| i).collect();
+        assert_eq!(bos.len(), 2, "two logical streams");
+        assert_eq!(eos, vec![bos[1] - 1, pages.len() - 1], "each ends with EOS, the first just before the second BOS");
+        let tags = |needle: &[u8]| stream.windows(needle.len()).any(|w| w == needle);
+        assert!(tags(b"TITLE=First") && tags(b"ARTIST=Angelo") && tags(b"TITLE=It's Two"));
+    }
 
     #[test]
     fn test_bytes_to_samples() {

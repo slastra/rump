@@ -4,18 +4,18 @@
 
 A clean, modern Icecast streaming client. Inspired by [BUTT](https://danielnoethen.de/butt/), rebuilt from scratch with a modern stack.
 
-Built with Rust, GTK4/libadwaita, PipeWire, and OGG Vorbis.
+Built with Rust, GTK4/libadwaita, PipeWire, and OGG Vorbis or Opus.
 
 ## Features
 
-- **Stream to Icecast**: OGG Vorbis encoding via direct HTTP SOURCE protocol
+- **Stream to Icecast**: OGG Vorbis or OGG Opus via direct HTTP SOURCE protocol
 - **PipeWire native**: capture any audio source or sink monitor (desktop audio)
 - **DJ mic mixing**: second audio source with push-to-talk and automatic music ducking
-- **MPRIS metadata**: picks up track info from any media player via playerctl
-- **Auto-reconnection**: recovers from Icecast connection drops (5 retries with backoff)
+- **MPRIS metadata**: picks up track info from any media player via playerctl; Opus streams carry titles in-band (OpusTags on a chained stream), Vorbis via Icecast's admin API
+- **Auto-reconnection**: recovers from Icecast connection drops, retrying with backoff (2 s up to 30 s) until stopped
 - **Always-on VU meters**: L/R music + mic level, active before streaming starts
 - **Global push-to-talk**: evdev-based hotkey combos (e.g., Alt+Space), works on Wayland
-- **Configurable encoding**: sample rate, channels, Vorbis quality
+- **Configurable encoding**: sample rate, channels, Vorbis quality or Opus bitrate
 - **Configurable ducking**: threshold, duck level, attack/release/hold envelope
 
 ## Screenshot
@@ -80,7 +80,7 @@ graph LR
     C1 -- music channel --> S
     C2 -- mic channel --> S
     PTT -- is_mic_active --> S
-    S -- OGG Vorbis --> IC[Icecast]
+    S -- OGG Vorbis / Opus --> IC[Icecast]
     META -- track info --> UI[GTK4 UI]
     META -- track info --> IC
     C1 -- VU levels --> UI
@@ -115,7 +115,7 @@ duck_hold_ms = 500
 |-----------|-----------|
 | UI | GTK4 + libadwaita |
 | Audio capture | PipeWire (via pw-record) |
-| Encoding | OGG Vorbis (vorbis_rs) |
+| Encoding | OGG Vorbis (vorbis_rs), OGG Opus (libopus) |
 | Streaming | Direct HTTP SOURCE to Icecast |
 | Metadata | playerctl (MPRIS/D-Bus) |
 | Push-to-talk | evdev (global keyboard events) |

@@ -103,14 +103,14 @@ async fn try_portal(
     let mic_press = mic_ptt.clone();
     let mut activated = shortcuts.receive_activated().await?;
     glib::spawn_future_local(async move {
-        while let Some(_) = activated.next().await {
+        while activated.next().await.is_some() {
             mic_press.store(true, Ordering::Relaxed);
         }
     });
 
     let mut deactivated = shortcuts.receive_deactivated().await?;
     glib::spawn_future_local(async move {
-        while let Some(_) = deactivated.next().await {
+        while deactivated.next().await.is_some() {
             mic_ptt.store(false, Ordering::Relaxed);
         }
     });

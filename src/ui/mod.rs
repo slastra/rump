@@ -261,6 +261,7 @@ pub fn build_ui(app: &adw::Application) {
                 "GTK4 + libadwaita",
                 "PipeWire (pw-record)",
                 "OGG Vorbis (vorbis_rs)",
+                "OGG Opus (libopus)",
                 "playerctl (MPRIS)",
                 "XDG Portal + evdev (PTT)",
             ]);

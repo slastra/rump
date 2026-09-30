@@ -190,7 +190,7 @@ pub(crate) fn open_preferences(parent: &adw::ApplicationWindow) {
         .margin_start(16).margin_end(16).margin_top(8).margin_bottom(16).build();
     let server_group = adw::PreferencesGroup::builder().title("Icecast Server").build();
     let host_row = adw::EntryRow::builder().title("Host").text(&config.host).build();
-    let port_row = adw::EntryRow::builder().title("Port").text(&config.port.to_string()).build();
+    let port_row = adw::EntryRow::builder().title("Port").text(config.port.to_string()).build();
     let mount_row = adw::EntryRow::builder().title("Mount").text(&config.mount).build();
     let pass_row = adw::PasswordEntryRow::builder().title("Password").text(&config.password).build();
     server_group.add(&host_row);

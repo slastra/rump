@@ -9,6 +9,7 @@ use libadwaita as adw;
 
 use super::state::{AppState, is_mic_active, reset_to_idle, rms_to_display};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn setup_timers(
     state: Rc<RefCell<AppState>>,
     left_meter: gtk4::LevelBar,
